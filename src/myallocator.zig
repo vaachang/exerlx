@@ -149,26 +149,34 @@ fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ret_addr: usize) ?[*]u
     const arena: *ArenaAllocator = @ptrCast(@alignCast(ctx));
     _ = ret_addr; // 不使用返回地址信息
 
-    assert(n > 0);
+    assert(n > 0); // 确认分配的内存大小要大于0
 
-    var cur_first_node = arena.loadFirstNode();
+    var cur_first_node = arena.loadFirstNode(); // 空闲链表的第一个
 
     var cur_new_node: ?*Node = null;
 
     // defer 后面跟一个表达式，在离开当前作用域时执行。执行顺序：后进先出LIFO
     // if()||{} optional捕获语法，只有非null时才进入语句块，node为解包后的payload
     defer if (cur_new_node) |node| {
-        node.next = null;
-        arena.pushFreeList(node, node);
+        node.next = null; // 针对空free_list优化
+        arena.pushFreeList(node, node); // first和last都是node
     };
 
+    // 带标签循环
     retry: while (true) {
+        // 多重赋值与解构，等号右边first_node: {}是一个带标签的块表达式
         const first_node: ?*Node, const prev_size: usize = first_node: {
+            // orelse optional解包，如果cur_first_node是null，表达式的值等于右边
             const node = cur_first_node orelse break :first_node .{ null, 0 };
-            const buf = node.loadBuf();
+            const buf = node.loadBuf(); // 返回实际的缓冲区地址
 
+            // toByteUnits返回对齐的字节数。为了能对齐到 alignment 并放下 n 字节，最坏情况下需要预留多少字节。
             const alignable = n + alignment.toByteUnits() - 1;
+            // 原子地增加 end_index 来“占用”一段内存。
+            // 用 .acquire 语义保证：如果别的线程之前通过 free/缩小 resize 释放过这段内存（那些操作用 .release），那么本线程在拿到新的 end_index 之后，一定能看到那些线程在释放前对这段内存做过的写入。
+            // 用 acquire 语义，同步任何可能已被其他线程释放的内存。Rmw返回旧值
             const end_index = @atomicRmw(usize, &node.end_index, .Add, alignable, .acquire);
+            // 获取对齐后的和缓冲区基址的相对偏移
             const aligned_index = alignedIndex(buf.ptr, end_index, alignment);
             assert(end_index + alignable >= aligned_index + n);
             if (end_index + alignable != aligned_index + n) {
