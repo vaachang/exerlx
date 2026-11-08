@@ -111,6 +111,37 @@ fn loadFirstNode(arena: *ArenaAllocator) ?*Node {
     return @atomicLoad(?*Node, &arena.state.used_list, .acquire); // 与成功的tryPushNode中的release同步
 }
 
+// 带标签的联合体，二选一类型，要么是success不带数据，要么是failure带一个?*Node数据。
+// 用enum做标签，运行时能知道当前是哪一种。
+const PushResult = union(enum){
+    success,
+    failure: ?*Node,
+};
+
+fn tryPushNode(arena: *ArenaAllocator, node: *Node) PushResult{
+    assert(node!=node.next);
+    if(@cmpxchgStrong( // 用 strong，因为重试意味着丢弃一个合适的节点 → 代价很高。
+        ?*Node,
+        &arena.state.used_list,
+        node.next,
+        node,
+        .release, // 成功写入，与失败路径或 loadFirstNode 中的 acquire 同步。
+        .acquire, // 需读出旧值，与成功路径的release同步
+    )) |old_node| {
+        return .{.failure = old_node};
+    }else{
+        return .success;
+    }
+}
+
+
+// 把free_list偷完
+fn stealFreeList(arena: *ArenaAllocator) ?*Node {
+    // 这里用不着 acq_rel，因为交换进去的总是 null；既然没有把任何节点“发布”出去，也就不需要 release 语义。
+    // 原子地把 arena.state.free_list 换成 null，并返回换之前的值（原来整个 free 链表的头）。
+    return @atomicRmw(?*Node, &arena.state.free_list, .Xchg, null, .acquire); // 与 pushFreeList 中的 release 同步。
+}
+
 // 无锁地把一段链表 [first, last] 推入 arena.state.free_list 头部的函数
 // 成功后free_list ──▶ first ──▶ ... ──▶ last ──▶ (原来的 free_list 头或 null)
 fn pushFreeList(arena: *ArenaAllocator, first: *Node, last: *Node) void {
@@ -151,7 +182,7 @@ fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ret_addr: usize) ?[*]u
 
     assert(n > 0); // 确认分配的内存大小要大于0
 
-    var cur_first_node = arena.loadFirstNode(); // 空闲链表的第一个
+    var cur_first_node = arena.loadFirstNode(); // 已使用链表的第一个
 
     var cur_new_node: ?*Node = null;
 
@@ -210,7 +241,7 @@ fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ret_addr: usize) ?[*]u
             defer node.endResize(size, allocated_slice.len); // 通过 defer 调用 endResize 释放 resizing 锁，并把（可能已经变大的）size 写回节点。
 
             const buf = allocated_slice[@sizeOf(Node)..]; // 数据缓冲区
-            // 读到旧值不会导致错误，只会导致这次 resize 作废、走其他路径。
+            // 读到旧值不会导致错误，只会导致这次 resize 作废、走其他路径。下面的@cmpxchgStrong会检查的
             const end_index = @atomicLoad(usize, &node.end_index, .monotonic); // end_index字段值
             const aligned_index = alignedIndex(buf.ptr, end_index, alignment); // end_index对齐后的相对偏移
             // mem.alignForward(usize, 值, 对齐数), 把 值 向上对齐到 对齐数 的整数倍
@@ -230,17 +261,95 @@ fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ret_addr: usize) ?[*]u
             if (arena.child_allocator.rawResize(allocated_slice, .of(Node), new_size, @returnAddress())) {
                 size = new_size; // 调整完毕，可以安全更新size
                 // 这里用 strong，是因为如果发生伪失败，可能会导致这个节点的空间利用率变差。
-                if (null == @cmpxchgStrong(
+                if (null == @cmpxchgStrong( // strong值相等时一定成功
                     usize,
                     &node.end_index,
                     end_index,
                     aligned_index + n,
                     .acquire, // 以 acquire 内存序，同步任何可能已被其他线程释放的内存。
                     .monotonic,
-                )) {
+                )) { // 成功的话才会返回null进入这个语句块
+                    // 从扩容后的节点内存起始地址开始，取前 new_size 字节，再去掉开头的 Node 头部，得到数据区的切片。
                     const new_buf = allocated_slice.ptr[0..new_size][@sizeOf(Node)..];
-                    return new_buf[aligned_index..][0..n].ptr;
+                    return new_buf[aligned_index..][0..n].ptr; // 函数返回
                 }
+            }
+        }
+
+        // 我们需要一个新节点！首先，我们在 free_list 里找一个足够大的；
+        // 如果在那儿找不到，就退回到用 child_allocator 分配一个新节点（如果我们还没这么做的话！）。
+        from_free_list: {
+            // 我们直接把整条 free_list “偷走”，这样操作期间就没有别的线程来插手。
+            // 这种做法比较务实；free_list 本身使用频率不高，所以即便在负载下性能也还可以。
+            // 而且它能避开 ABA 问题——用一次原子交换把整条链表偷走，不会留下任何可能过期的 next 指针。
+            const free_list = arena.stealFreeList() orelse break :from_free_list; // 为空退出block，保证free_list不为空
+
+            const first_free: *Node, const last_free: *Node, const node: *Node, const prev: ?*Node = find: {
+                var best_fit_prev: ?*Node = null;
+                var best_fit: ?*Node = null;
+                // 把 best_fit_diff 初始化为 usize 能表示的最大值，表示“目前还没找到任何候选节点”；
+                var best_fit_diff: usize = std.math.maxInt(usize);
+
+                var it_prev: ?*Node = null; // 初始迭代器的前一节点为空
+                var it: ?*Node = free_list; // 初始迭代器为free_list
+                // 只要it不是null，就解包出node执行循环体，每轮循环结束时，执行:({...})里的继续表达式，把it_prev更新为当前节点，it推进到下一节点
+                // 类似 C 的 for (;; 这里)
+                while (it) |node| : ({
+                    it_prev = node; // 这里会持续更新，直到尾节点，所以不能在diff=0的这个地方退出
+                    it = node.next;
+                }) {
+                    assert(!node.size.resizing); // 节点不应该处于“正在被 resize”的状态
+                    // 因为节点已经被 stealFreeList 偷到私有链表，本线程独占，不需要 resizing 标志做排他。
+                    // 所以 free_list 里的节点即使被 resize，也不会进入 resizing == true 状态。
+                    // 取出节点整个内存切片，跳过开头的 Node 头部，得到数据区切片 buf。
+                    const buf = node.allocatedSliceUnsafe()[@sizeOf(Node)..];
+                    // 从数据区起点 buf.ptr 开始，算出第一个满足 alignment 对齐的地址相对于 buf.ptr 的偏移量。
+                    const aligned_index = alignedIndex(buf.ptr, 0, alignment);
+
+                    // 算这个空闲节点离“放得下 n 字节”还差多少。放得下就是 0；放不下就是差多少字节。
+                    // aligned_index + n 在这个节点里放下 n 字节，数据需要到达的偏移。
+                    // -|是饱和减法，a>=b返回a-b，a<b返回0
+                    const diff = aligned_index + n -| buf.len;
+                    // 如果当前节点比之前找到的最佳节点更合适（diff 更小），就把它记为新的最佳，同时记下它的前驱和差距。
+                    if (diff < best_fit_diff) {
+                        best_fit_prev = it_prev; // 记录快照
+                        best_fit = node;
+                        best_fit_diff = diff; // 更新差值
+                    }
+                }
+                // 返回头部节点，尾部节点的前驱，最适合节点及其前驱。不为空，可以.?解包
+                break :find .{ free_list, it_prev.?, best_fit.?, best_fit_prev };
+            };
+
+            const aligned_index, const need_resize = aligned_index: {
+                // 提取best_fit节点的数据区
+                const buf = node.allocatedSliceUnsafe()[@sizeOf(Node)..];
+                // 算出第一个数据的索引位置
+                const aligned_index = alignedIndex(buf.ptr, 0, alignment);
+                // aligned_index + n > buf.len 数据终点超过节点大小，需要扩容
+                break :aligned_index .{ aligned_index, aligned_index + n > buf.len };
+            };
+
+            if (need_resize) {
+                // 理想情况下，free_list 里的节点我们最终都想用上；因此哪怕没有一个够大，也会拿“差得最少”的那个节点去 resize，尽量把它扩到够用。
+                const new_size = mem.alignForward(usize, @sizeOf(Node) + aligned_index + n, 2); // 算出新大小
+                // 扩容node
+                if (arena.child_allocator.rawResize(node.allocatedSliceUnsafe(), .of(Node), new_size, @returnAddress())) {
+                    node.size = .fromInt(new_size); // 更新size字段
+                } else { // 底层分配器扩容失败
+                    arena.pushFreeList(first_free, last_free); // 放回
+                    break :from_free_list; // 退出当前块，我们没能找到合适的空闲节点。
+                }
+            }
+
+            const buf = node.allocatedSliceUnsafe()[@sizeOf(Node)..];
+            const old_next = node.next;
+
+            node.end_index = aligned_index + n;
+            node.next = first_node;
+
+            switch(arena.tryPushNode(node)) {
+                .
             }
         }
     }
