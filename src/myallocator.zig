@@ -113,14 +113,15 @@ fn loadFirstNode(arena: *ArenaAllocator) ?*Node {
 
 // 带标签的联合体，二选一类型，要么是success不带数据，要么是failure带一个?*Node数据。
 // 用enum做标签，运行时能知道当前是哪一种。
-const PushResult = union(enum){
+const PushResult = union(enum) {
     success,
     failure: ?*Node,
 };
 
-fn tryPushNode(arena: *ArenaAllocator, node: *Node) PushResult{
-    assert(node!=node.next);
-    if(@cmpxchgStrong( // 用 strong，因为重试意味着丢弃一个合适的节点 → 代价很高。
+fn tryPushNode(arena: *ArenaAllocator, node: *Node) PushResult {
+    // 如果 node.next == node，说明链表已经形成自环，后续访问会死循环；这是严重 bug，尽早 panic。
+    assert(node != node.next);
+    if (@cmpxchgStrong( // 用 strong，因为重试意味着丢弃一个合适的节点 → 代价很高。
         ?*Node,
         &arena.state.used_list,
         node.next,
@@ -128,12 +129,11 @@ fn tryPushNode(arena: *ArenaAllocator, node: *Node) PushResult{
         .release, // 成功写入，与失败路径或 loadFirstNode 中的 acquire 同步。
         .acquire, // 需读出旧值，与成功路径的release同步
     )) |old_node| {
-        return .{.failure = old_node};
-    }else{
+        return .{ .failure = old_node };
+    } else {
         return .success;
     }
 }
-
 
 // 把free_list偷完
 fn stealFreeList(arena: *ArenaAllocator) ?*Node {
@@ -342,14 +342,52 @@ fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ret_addr: usize) ?[*]u
                 }
             }
 
+            // 获取node数据缓冲区
             const buf = node.allocatedSliceUnsafe()[@sizeOf(Node)..];
-            const old_next = node.next;
+            const old_next = node.next; // 备份next指针
 
-            node.end_index = aligned_index + n;
-            node.next = first_node;
+            node.end_index = aligned_index + n; // 更新空间末尾指针
+            node.next = first_node; // 更新next指针，满足tryPushNode条件
 
-            switch(arena.tryPushNode(node)) {
-                .
+            switch (arena.tryPushNode(node)) {
+                .success => {
+                    // 完成从 free_list 中摘除该节点。
+                    // prev是node原本的前驱节点
+                    if (prev) |p| p.next = old_next; // 成功摘除，链上
+
+                    // 把偷来的空闲链表中剩下的部分放回 arena.state.free_list。
+                    // 处理两种特殊情况，摘除的是头节点/尾节点
+                    const new_first_free = if (node == first_free) old_next else first_free;
+                    const new_last_free = if (node == last_free) prev else last_free;
+                    // 头部结点为空也就没有必要归还了
+                    if (new_first_free) |first| {
+                        const last = new_last_free.?; // 解包头尾节点，但不需要判尾部是否为空。头不为空则尾不为空
+                        arena.pushFreeList(first, last);
+                    }
+
+                    // 返回从aligned_index开始的指针，确保对齐
+                    return buf[aligned_index..][0..n].ptr;
+                },
+                .failure => |old_first_node| {
+                    // 把空闲链表恢复成我们发现它时的样子
+                    node.next = old_next; // 恢复节点，重试
+                    arena.pushFreeList(first_free, last_free);
+
+                    cur_first_node = old_first_node; // 因为有新插入的头节点，所以更新cur_first_node
+                    continue :retry; // 有一个新的头节点，重试
+                },
+            }
+        }
+
+        const new_node: *Node = new_node: {
+            if(cur_new_node) | new_node| {
+                break :new_node new_node;
+            }esle{
+                @branchHint(.cold);
+            }
+
+            const size: Node.Size = size: {
+            const min_size
             }
         }
     }
