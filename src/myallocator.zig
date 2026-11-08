@@ -170,53 +170,72 @@ fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ret_addr: usize) ?[*]u
             const node = cur_first_node orelse break :first_node .{ null, 0 };
             const buf = node.loadBuf(); // 返回实际的缓冲区地址
 
+            // 为了避免在热路径上使用CAS循环，我们原子地把end_index增加一个足够大的量，确保预留的内存里一定能满足对齐要求。
+            // 为了回收因此可能浪费的空间，我们随后用一次 cmpxchg 尝试把“多预留的部分”减回去；这次操作允许失败。
+
             // toByteUnits返回对齐的字节数。为了能对齐到 alignment 并放下 n 字节，最坏情况下需要预留多少字节。
             const alignable = n + alignment.toByteUnits() - 1;
             // 原子地增加 end_index 来“占用”一段内存。
             // 用 .acquire 语义保证：如果别的线程之前通过 free/缩小 resize 释放过这段内存（那些操作用 .release），那么本线程在拿到新的 end_index 之后，一定能看到那些线程在释放前对这段内存做过的写入。
             // 用 acquire 语义，同步任何可能已被其他线程释放的内存。Rmw返回旧值
             const end_index = @atomicRmw(usize, &node.end_index, .Add, alignable, .acquire);
-            // 获取对齐后的和缓冲区基址的相对偏移
+            // 获取原end_index对齐后的和缓冲区基址的相对偏移。存放数据的实际起址（因为要对齐）
             const aligned_index = alignedIndex(buf.ptr, end_index, alignment);
-            assert(end_index + alignable >= aligned_index + n);
+            // end_index + alignable 我实际预留的位置，end_index已被更新为这个值。最坏情况下预留的终点
+            // aligned_index + n     数据实际需要到哪个位置，从对齐点放n个字节后的末尾位置。对齐后放完数据的终点
+            assert(end_index + alignable >= aligned_index + n); // 实际分配空间的末尾 >= 实际占用空间的末尾
             if (end_index + alignable != aligned_index + n) {
-                _ = @cmpxchgStrong(
+                // 把之前多预留的对齐填充padding还回去，让end_index从“最坏预留终点”退回“实际数据终点”。
+                _ = @cmpxchgStrong( // 不要求成功，只是优化
                     usize,
                     &node.end_index,
                     end_index + alignable,
                     aligned_index + n,
-                    .monotonic,
+                    .monotonic, // 不需要用 release 语义发布对齐填充；因为没有任何线程在访问这块 padding。
                     .monotonic,
                 );
             }
 
+            // node.end_index不一定小于buf_len，以实际占用长度判断
+            // 这个节点放不下这次分配，退出。返回当前节点和当前节点对应缓冲区总长度
             if (aligned_index + n > buf.len) break :first_node .{ node, buf.len };
-            return buf[aligned_index..][0..n].ptr;
+            return buf[aligned_index..][0..n].ptr; // 函数返回
         };
 
         resize: {
-            const node = first_node orelse break :resize;
+            const node = first_node orelse break :resize; // 为空则退出resize块
+            // 尝试独占这个节点并开始 resize；如果节点已经被别的线程占用（正在 resize），就跳出 resize: 块，放弃在当前节点上扩容，改走后面的路径。
             const allocated_slice = node.beginResize() orelse break :resize;
-            var size = allocated_slice.len;
-            defer node.endResize(size, allocated_slice.len);
+            var size = allocated_slice.len; // 记录当前节点大小size
+            defer node.endResize(size, allocated_slice.len); // 通过 defer 调用 endResize 释放 resizing 锁，并把（可能已经变大的）size 写回节点。
 
-            const buf = allocated_slice[@sizeOf(Node)..];
-            const end_index = @atomicLoad(usize, &node.end_index, .monotonic);
-            const aligned_index = alignedIndex(buf.ptr, end_index, alignment);
-            const new_size = mem.alignForward(usize, @sizeOf(Node) + aligned_index + n, 2);
+            const buf = allocated_slice[@sizeOf(Node)..]; // 数据缓冲区
+            // 读到旧值不会导致错误，只会导致这次 resize 作废、走其他路径。
+            const end_index = @atomicLoad(usize, &node.end_index, .monotonic); // end_index字段值
+            const aligned_index = alignedIndex(buf.ptr, end_index, alignment); // end_index对齐后的相对偏移
+            // mem.alignForward(usize, 值, 对齐数), 把 值 向上对齐到 对齐数 的整数倍
+            const new_size = mem.alignForward(usize, @sizeOf(Node) + aligned_index + n, 2); // +n了
 
             if (new_size <= allocated_slice.len) {
+                // 有一个 resize 或 free 调用插了进来，而我们需要保证 size 只会增加；重试！
+                // 进入 resize: 块的前提是“热路径发现当前节点放不下”。
+                // 但进来后重新读 end_index 算出的 new_size 如果 <= allocated_slice.len，
+                // 说明基于最新状态当前节点其实放得下（或不需要再扩），不需要 resize，应该回到 retry 循环重新走热路径。
                 continue :retry;
             }
 
+            // 调用底层分配器，尝试把 allocated_slice 这块内存原地调整到 new_size 大小；成功返回 true
+            // @returnAddress() 是 Zig 的一个内建函数（builtin function），它的核心作用是获取当前函数返回后，调用者将要执行的下一条指令的地址。
+            // 按照Node的方式对齐
             if (arena.child_allocator.rawResize(allocated_slice, .of(Node), new_size, @returnAddress())) {
-                size = new_size;
+                size = new_size; // 调整完毕，可以安全更新size
+                // 这里用 strong，是因为如果发生伪失败，可能会导致这个节点的空间利用率变差。
                 if (null == @cmpxchgStrong(
                     usize,
                     &node.end_index,
                     end_index,
                     aligned_index + n,
-                    .acquire,
+                    .acquire, // 以 acquire 内存序，同步任何可能已被其他线程释放的内存。
                     .monotonic,
                 )) {
                     const new_buf = allocated_slice.ptr[0..new_size][@sizeOf(Node)..];
