@@ -442,10 +442,90 @@ fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, r
     _ = alignment;
     _ = ret_addr;
 
+    // 参数检查
     assert(memory.len > 0);
     assert(new_len > 0);
 
+    const node = arena.loadFirstNode().?; // 返回used_list中的第一个节点
+    const buf_ptr = @as([*]u8, @ptrCast(node)) + @sizeOf(Node); // buf多元素指针char*
+
+    const cur_end_index = @atomicLoad(usize, &node.end_index, .monotonic); // 不需要同步，只需要最简单的内存序即可
+
+    if (buf_ptr + cur_end_index != memory.ptr + memory.len) {
+        // 它不是最近一次分配，所以无法扩展；不过如果调用方想把它缩小，那没问题。
+        // 还有一种可能，是最近一次分配，不过概率很小
+        return new_len <= memory.len; // 可以缩小
+    }
+
+    // 就是最近一次分配，并且要求缩减占用空间
+    if (new_len <= memory.len) {
+        const new_end_index = cur_end_index - (memory.len - new_len);
+        assert(buf_ptr + new_end_index == memory.ptr + new_len);
+
+        _ = @cmpxchgStrong(
+            usize,
+            &node.end_index,
+            cur_end_index,
+            new_end_index,
+            .release, // 释放空闲内存
+            .monotonic, // 失败表明当前内存块不是node的最后一块内存，不处理这种情况
+        );
+        return true; // 缩小分配应当总是成功
+    }
+
+    // 使用饱和运算，因为 `end_index` 并不保证 `<= size`。
+    // 我们尝试调整大小的这块分配 *可能* 属于另一个节点！
+    // 计算剩余空间和申请的增量
+    // memory 可能根本不属于当前这个 node。
+    if (node.loadBuf().len -| cur_end_index >= new_len - memory.len) {
+        const new_end_index = cur_end_index + (new_len - memory.len);
+        assert(buf_ptr + new_end_index == memory.ptr + new_len);
+
+        return null == @cmpxchgStrong(
+            usize,
+            &node.end_index,
+            cur_end_index,
+            new_end_index,
+            .acquire, // 获取任何可能已被释放的内存。
+            .monotonic,
+        );
+    }
+
+    return false;
+}
+
+fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    return if (resize(ctx, memory, alignment, new_len, ret_addr)) memory.ptr else null;
+}
+
+fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
+    const arena: *ArenaAllocator = @ptrCast(@alignCast(ctx));
+    _ = alignment;
+    _ = ret_addr;
+
+    // 参数检查
+    assert(memory.len > 0);
+
     const node = arena.loadFirstNode().?;
+    const buf_ptr = @as([*]u8, @ptrCast(node)) + @sizeOf(Node);
+
+    const cur_end_index = @atomicLoad(usize, &node.end_index, .monotonic);
+
+    if (buf_ptr + cur_end_index != memory.ptr + memory.len) {
+        return;
+    }
+
+    const new_end_index = cur_end_index - memory.len;
+    assert(buf_ptr + new_end_index == memory.ptr);
+
+    _ = @cmpxchgStrong(
+        usize,
+        &node.end_index,
+        cur_end_index,
+        new_end_index,
+        .release, // 释放空闲内存
+        .monotonic,
+    );
 }
 
 const std = @import("std");
