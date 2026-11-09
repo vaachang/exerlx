@@ -40,6 +40,150 @@ pub fn allocator(arena: *ArenaAllocator) Allocator {
     };
 }
 
+// 从child allocator构建一个ArenaAllocator
+pub fn init(child_allocator: Allocator) ArenaAllocator {
+    return State.init.promote(child_allocator); // 从State.init开始
+}
+
+// 非线程安全
+pub fn deinit(arena: ArenaAllocator) void {
+    // 注意：修改此处时，请确保相应地调整 reset()！
+    // [_]?*Node{ ... } 是一个数组字面量，元素类型是 ?*Node，长度由后面元素个数自动推断。
+    // for (...) |first_node| 表示遍历这个数组，每次把当前元素绑定到 first_node。
+    for ([_]?*Node{ arena.state.used_list, arena.state.free_list }) |first_node| {
+        var it = first_node;
+        while (it) |node| { // it不为空时解包出node
+            // 这必须在释放之前发生，因为释放操作会释放 node 本身。
+            it = node.next;
+            // 释放node缓冲区，包含node头部
+            arena.child_allocator.rawFree(node.allocatedSliceUnsafe(), .of(Node), @returnAddress());
+        }
+    }
+}
+
+// 查询此 arena 当前的内存使用量。
+// 这不包括内部维护所需的存储。
+// 非线程安全
+pub fn queryCapacity(arena: ArenaAllocator) usize {
+    var capacity: usize = 0;
+    // 对used链和free链统计size，减去Node自身大小
+    for ([_]?*Node{ arena.state.used_list, arena.state.free_list }) |first_node| {
+        capacity += countListCapacity(first_node);
+    }
+    return capacity;
+}
+
+fn countListCapacity(first_node: ?*Node) usize {
+    var capacity: usize = 0;
+    var it = first_node;
+    while (it) |node| : (it = node.next) {
+        // 计算实际分配的大小，其中不包括链表节点本身
+        capacity += node.size.toInt() - @sizeOf(Node);
+    }
+    return capacity;
+}
+
+pub const ResetMode = union(enum) {
+    // 释放 arena 中所有已分配的内存。
+    free_all,
+    // 通过为之前所有已完成的分配分配一个足够大的缓冲区，为未来的分配预热 arena。
+    // 预热会通过比之前更少地调用后备分配器来加速分配过程。
+    // 如果在循环中使用 reset()，这意味着在最大的一次操作之后，将不再执行任何内存分配。
+    retain_capacity,
+    // 这与 retain_capacity 相同，但如果内存超过此限制，将会被收缩到此值。
+    retain_with_limit: usize,
+};
+
+pub fn reset(arena: *ArenaAllocator, mode: ResetMode) bool {
+    const limit: ?usize = switch (mode) {
+        .retain_capacity => null,
+        // Zig switch 的 payload 捕获（capture） 语法。
+        .retain_with_limit => |limit| limit,
+        .free_all => 0,
+    };
+    // 当我们没有任何需要重新分配的内容时，就直接重置。
+    if (limit == 0) {
+        arena.deinit();
+        arena.state = .init; // 重置状态
+        return true; // 重置成功
+    }
+
+    // 算出两个capacity
+    const used_capacity = countListCapacity(arena.state.used_list);
+    const free_capacity = countListCapacity(arena.state.free_list);
+
+    // 现在limit要么为空，要么不为0
+    // 保证两者加起来不超过limit
+    // 优先保证used_capacity
+    const new_used_capacity = if (limit) |lim| @min(lim, used_capacity) else used_capacity;
+    // new_used_capacity 一定小于等于 lim，所以lim - new_used_capacity >= 0
+    const new_free_capacity = if (limit) |lim| @min(lim - new_used_capacity, free_capacity) else free_capacity;
+
+    var ok = true;
+
+    for (
+        // Zig 的多序列 for 循环：同时遍历两个数组，每次迭代各取一个元素，长度必须相同。
+        [_]*?*Node{ &arena.state.used_list, &arena.state.free_list },
+        [_]usize{ new_used_capacity, new_free_capacity },
+    ) |first_node_ptr, new_capacity| {
+        // 释放除最后一个节点之外的所有节点。
+        var it = first_node_ptr.*; // 类型?*Node
+        const node: *Node = while (it) |node| {
+            // 这必须在释放之前发生，因为释放操作会释放 node 本身。
+            it = node.next;
+            // 在遍历链表时找到最后一个节点，并把它作为循环的返回值跳出
+            if (it == null) break node; // 带值返回
+            arena.child_allocator.rawFree(node.allocatedSliceUnsafe(), .of(Node), @returnAddress());
+        } else {
+            // else 属于 while。continue 跳的是外层的 for，不是 while
+            // while 是表达式，可以带值。
+            continue; // 这个分支不产生值
+        };
+        // node的全部缓冲区带头部
+        const allocated_slice = node.allocatedSliceUnsafe();
+
+        // 向后对齐，以始终保持在限制之下。需要是2的倍数，满足Size类型
+        const new_size = mem.alignBackward(usize, @sizeOf(Node) + new_capacity, 2);
+
+        // 如果只剩头部，那没什么好说的，直接free掉。
+        if (new_size == @sizeOf(Node)) {
+            arena.child_allocator.rawFree(allocated_slice, .of(Node), @returnAddress());
+            first_node_ptr.* = null; // used_list或free_list为空
+            continue;
+        }
+
+        node.end_index = 0; // 重置end_index
+        first_node_ptr.* = node; // 变成头结点
+
+        // 完美，无需调用子分配器。
+        if (allocated_slice.len == new_size) {
+            continue;
+        }
+
+        if (arena.child_allocator.rawResize(allocated_slice, .of(Node), new_size, @returnAddress())) {
+            // 成功改变大小
+            node.size = .fromInt(new_size); // 更新size字段信息
+        } else {
+            // 手动realloc
+            const new_ptr = arena.child_allocator.rawAlloc(new_size, .of(Node), @returnAddress()) orelse {
+                // 我们未能正确地预热 arena，将这一点通知给用户。
+                ok = false;
+                continue;
+            };
+            arena.child_allocator.rawFree(allocated_slice, .of(Node), @returnAddress());
+            const new_first_node: *Node = @ptrCast(@alignCast(new_ptr)); // 转换指针
+            new_first_node.* = .{
+                .size = .fromInt(new_size),
+                .end_index = 0,
+                .next = null,
+            };
+            first_node_ptr.* = new_first_node; // 更新头结点
+        }
+    }
+
+    return ok;
+}
+
 const Node = struct {
     size: Size,
     end_index: usize,
@@ -506,22 +650,28 @@ fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) vo
     // 参数检查
     assert(memory.len > 0);
 
+    // 第一个被使用的结点
     const node = arena.loadFirstNode().?;
+    // 结点数据区指针转为[*]u8
     const buf_ptr = @as([*]u8, @ptrCast(node)) + @sizeOf(Node);
 
+    // 获取node的.end_index字段
     const cur_end_index = @atomicLoad(usize, &node.end_index, .monotonic);
 
     if (buf_ptr + cur_end_index != memory.ptr + memory.len) {
+        // 这不是最近一次分配；我们无法释放它。
         return;
     }
 
+    // 算出释放后新的end_index
     const new_end_index = cur_end_index - memory.len;
+    // 理论上等于memory内存起始地址
     assert(buf_ptr + new_end_index == memory.ptr);
 
     _ = @cmpxchgStrong(
         usize,
         &node.end_index,
-        cur_end_index,
+        cur_end_index, // 等于快照值
         new_end_index,
         .release, // 释放空闲内存
         .monotonic,
