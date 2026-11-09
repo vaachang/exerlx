@@ -51,6 +51,7 @@ const Node = struct {
         _: @Int(.unsigned, @bitSizeOf(usize) - 1) = 0, // _是匿名填充字段
 
         fn fromInt(int: usize) Size { // 传入int的需要是2的倍数
+            // 至少要覆盖Node头部大小
             assert(int >= @sizeOf(Node)); // @sizeOf求类型在内存中占用的字节数
             // @bitCast位模式重新解释
             const size: Size = @bitCast(int); // 局部const不要求值编译器确定，只要求绑定不可变
@@ -380,17 +381,71 @@ fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ret_addr: usize) ?[*]u
         }
 
         const new_node: *Node = new_node: {
-            if(cur_new_node) | new_node| {
+            // 解包cur_new_node，进入第二轮循环就有payload了
+            if (cur_new_node) |new_node| {
                 break :new_node new_node;
-            }esle{
+            } else {
+                // Zig 语言向编译器提供分支预测提示的内置函数。
+                // 告诉优化器：这条分支路径在程序运行时“几乎不可能”会被执行到。
+                // .cold相比.unlikely语义更强
                 @branchHint(.cold);
             }
 
             const size: Node.Size = size: {
-            const min_size
-            }
+                // 最少需要放入Node头部、对齐填充、n这么多空间
+                const min_size = @sizeOf(Node) + alignment.toByteUnits() + n;
+                // prev_size原缓冲区的大小，额外16字节余量
+                const big_enough_size = prev_size + min_size + 16;
+                // 先把 big_enough_size 放大到约 1.5 倍，再向上对齐到 2 的倍数。
+                const size = mem.alignForward(usize, big_enough_size + big_enough_size / 2, 2); // 保证是2的倍数
+                break :size .fromInt(size); // size需要是2的倍数
+            };
+            const ptr = arena.child_allocator.rawAlloc(size.toInt(), .of(Node), @returnAddress()) orelse
+                return null; // 否则没有办法继续分配了
+            const new_node: *Node = @ptrCast(@alignCast(ptr)); // 转成Node指针
+            new_node.* = .{ // 给字段赋值
+                .size = size,
+                .end_index = undefined, // 在下面设置
+                .next = undefined, // 在下面设置
+            };
+            cur_new_node = new_node;
+            break :new_node new_node; // 返回并赋值
+        };
+
+        // 提取出数据缓冲区，新分配节点，不存在线程争用
+        const buf = new_node.allocatedSliceUnsafe()[@sizeOf(Node)..];
+        // 找到n字节数据插入起始索引
+        const aligned_index = alignedIndex(buf.ptr, 0, alignment);
+        // 确保缓冲区能容下Node头部+对齐padding+n字节
+        assert(new_node.size.toInt() >= @sizeOf(Node) + aligned_index + n);
+
+        // 更新end_index，数据末尾索引
+        new_node.end_index = aligned_index + n;
+        // 更新next指针，插入used_list中
+        new_node.next = first_node;
+
+        switch (arena.tryPushNode(new_node)) {
+            .success => {
+                cur_new_node = null; // 置空并返回，因为有defer必须置空
+                return buf[aligned_index..][0..n].ptr;
+            },
+            .failure => |old_first_node| { // 说明used_list的头结点发生变化，需要更新当前信息
+                cur_first_node = old_first_node;
+                // defer会兜底，分配出的新节点cur_new_node进入used_list或者插入free_list中（只执行一次）
+            },
         }
     }
+}
+
+fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
+    const arena: *ArenaAllocator = @ptrCast(@alignCast(ctx));
+    _ = alignment;
+    _ = ret_addr;
+
+    assert(memory.len > 0);
+    assert(new_len > 0);
+
+    const node = arena.loadFirstNode().?;
 }
 
 const std = @import("std");
