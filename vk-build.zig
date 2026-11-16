@@ -33,5 +33,22 @@ pub fn build(b: *std.Build) void {
         const vk_zig_module = b.addModule("vulkan-zig", .{
             .root_source_file = vk_zig,
         });
+
+        const vk_zif_install_step = b.addInstallFile(vk_zig, "src/vk.zig");
+        b.getInstallStep().dependOn(&vk_zig_install_step.step);
+
+        const ref_all_decls_test = b.addObject(.{
+            .name = "ref-all-decls-test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/ref_all_decls.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        ref_all_decls_test.root_module.addImport("vulkan", vk_zig_module);
+        test_step.dependOn(&ref_all_decls_test.step);
     }
+
+    const test_target = b.addTest(.{ .root_module = root_module });
+    test_step.dependOn(&b.addRunArtifact(test_target).step);
 }
