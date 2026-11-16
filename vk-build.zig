@@ -64,12 +64,24 @@ pub fn build(b: *std.Build) void {
         const vk_zig = vk_generate_cmd.addOutputFileArg("vk.zig");
         // 把生成出来的 vk.zig 注册成一个名为 vulkan-zig 的公共模块
         const vk_zig_module = b.addModule("vulkan-zig", .{
-            .root_source_file = vk_zig,
+            .root_source_file = vk_zig, // 这里root_source_file是一个LazyPath
         });
 
+        // 如果registry被传入，也要安装vk.zig
+        // 创建一个"安装文件"的步骤
+        // 把 vk_zig 这个文件（构建时生成的 vk.zig）复制到安装目录下的 src/vk.zig 位置。
+        // 注意是目标路径，相对于安装前缀
         const vk_zig_install_step = b.addInstallFile(vk_zig, "src/vk.zig");
+        // 把刚才创建的 vk_zig_install_step 挂到内置的 install 步骤上，
+        // 建立依赖关系——执行 install 之前必须先执行 vk_zig_install_step。
         b.getInstallStep().dependOn(&vk_zig_install_step.step);
 
+        // 并且也对这份 vk.zig 运行测试。
+
+        // 这个测试需要被编译成一个对象（object），这样 vulkan-zig 才能从根（模块）导入类型。
+        // 无论如何它都不需要实际运行。
+        // 在构建图里声明一个"把 test/ref_all_decls.zig 编译成目标文件（object file，.o）"的步骤，
+        // 产物名叫 ref-all-decls-test。它不产生可执行程序，也不运行任何东西，只做编译。
         const ref_all_decls_test = b.addObject(.{
             .name = "ref-all-decls-test",
             .root_module = b.createModule(.{
@@ -78,10 +90,16 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        // 给 ref_all_decls_test 这个编译步骤的根模块添加一个导入，
+        // 让 test/ref_all_decls.zig 里可以用 @import("vulkan") 引用生成的 vk.zig 模块。
         ref_all_decls_test.root_module.addImport("vulkan", vk_zig_module);
         test_step.dependOn(&ref_all_decls_test.step);
     }
 
+    // 在构建图里声明一个"把 root_module（入口 src/main.zig）编译成测试可执行文件"的步骤，
+    // 产物名默认取自源码，用于运行 src/main.zig 里的单元测试。
     const test_target = b.addTest(.{ .root_module = root_module });
+    // 创建一个"运行测试程序"的步骤，并把它挂到 test 步骤上
+    // 执行 zig build test 时，会编译并运行 test_target 这个测试可执行文件。
     test_step.dependOn(&b.addRunArtifact(test_target).step);
 }
