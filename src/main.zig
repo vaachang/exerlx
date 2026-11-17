@@ -63,17 +63,30 @@ fn testOne(context: void, smith: *std.testing.Smith) !void {
     const gpa = std.testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
+    // smith.eos()：end of stream，输入数据用完了就停。
+    // smith.value(enum { add_data, dup_data })：从剩余数据里“随机”选一个枚举变体，
+    // 决定本次操作是追加新数据还是复制已有数据。
     while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
         .add_data => {
+            // addManyAsSlice的第一个参数是*Self，*Self是const Self = @This();在结构体内声明的别名
+            // 调整数组大小，新增 n 个元素，这些元素的值为 undefined（未初始化）。
+            // 从 fuzz 输入数据流里确定性地读出一个 4 位无符号整数，取值范围 0..15
+            // 返回值是一个切片，指向新分配的这些元素。
             const slice = try list.addManyAsSlice(gpa, smith.value(u4));
+            // 从流中取字节，原地填充
             smith.bytes(slice);
         },
+        // 复制数据
         .dup_data => {
             if (list.items.len == 0) continue;
             if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
+            // 将返回值严格限制在你指定的闭区间 [at_least, at_most] 内。
             const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
+            // @intCast，整数类型转换，目标类型由上下文推断
             const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
+            // 一次只append不多于32个元素
             try list.appendSlice(gpa, list.items[off..][0..len]);
+            // 对比list.items[off..][0..len]和末尾的len字节
             try std.testing.expectEqualSlices(
                 u8,
                 list.items[off..][0..len],
